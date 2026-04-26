@@ -1,4 +1,4 @@
 [submodule "cutlass"]
 	path = cutlass
-	url = https://github.com/StudyingShao/cutlass.git
-	branch = jiangs/v4.3.2/low_latency_fp8xfp8_gemm
+	url = https://github.com/DylanChen-NV/cutlass.git
+	branch = feat/adaptive-gemv-w4a8
