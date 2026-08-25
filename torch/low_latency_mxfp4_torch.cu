@@ -64,14 +64,15 @@ std::vector<torch::Tensor> preprocess_weight(
   return {interleaved, interleaved_offsets, residual};
 }
 
-torch::Tensor grouped_gemm_out(
+torch::Tensor grouped_gemm_out_impl(
     torch::Tensor acts, torch::Tensor activation_scales,
     torch::Tensor interleaved_weight, torch::Tensor interleaved_exp_offsets,
     torch::Tensor expert_residual, torch::Tensor expert_offsets,
     torch::Tensor token_counts, torch::Tensor token_scales,
     torch::Tensor tile_experts, torch::Tensor tile_n,
     torch::Tensor num_tiles, torch::Tensor output,
-    int64_t n, int64_t k, int64_t persistent_ctas) {
+    int64_t n, int64_t k, int64_t persistent_ctas,
+    bool token_counts_are_precomputed) {
   for (const auto& item : {
            std::pair<const torch::Tensor*, const char*>{&acts, "acts"},
            {&activation_scales, "activation_scales"},
@@ -120,9 +121,11 @@ torch::Tensor grouped_gemm_out(
 
   c10::cuda::CUDAGuard device_guard(acts.device());
   const cudaStream_t stream = current_stream(acts);
-  counts_from_offsets_kernel<<<1, 256, 0, stream>>>(
-      expert_offsets.data_ptr<int32_t>(), token_counts.data_ptr<int32_t>(),
-      experts);
+  if (!token_counts_are_precomputed) {
+    counts_from_offsets_kernel<<<1, 256, 0, stream>>>(
+        expert_offsets.data_ptr<int32_t>(), token_counts.data_ptr<int32_t>(),
+        experts);
+  }
   mga::launch_low_latency_mxfp4_fp8_combine_token_scales(
       activation_scales.data_ptr<float>(), expert_residual.data_ptr<float>(),
       expert_offsets.data_ptr<int32_t>(), token_scales.data_ptr<float>(),
@@ -153,9 +156,40 @@ torch::Tensor grouped_gemm_out(
 }
 }  // namespace
 
+torch::Tensor grouped_gemm_out(
+    torch::Tensor acts, torch::Tensor activation_scales,
+    torch::Tensor interleaved_weight, torch::Tensor interleaved_exp_offsets,
+    torch::Tensor expert_residual, torch::Tensor expert_offsets,
+    torch::Tensor token_counts, torch::Tensor token_scales,
+    torch::Tensor tile_experts, torch::Tensor tile_n,
+    torch::Tensor num_tiles, torch::Tensor output,
+    int64_t n, int64_t k, int64_t persistent_ctas) {
+  return grouped_gemm_out_impl(
+      acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
+      expert_residual, expert_offsets, token_counts, token_scales,
+      tile_experts, tile_n, num_tiles, output, n, k, persistent_ctas, false);
+}
+
+torch::Tensor grouped_gemm_out_precomputed_counts(
+    torch::Tensor acts, torch::Tensor activation_scales,
+    torch::Tensor interleaved_weight, torch::Tensor interleaved_exp_offsets,
+    torch::Tensor expert_residual, torch::Tensor expert_offsets,
+    torch::Tensor token_counts, torch::Tensor token_scales,
+    torch::Tensor tile_experts, torch::Tensor tile_n,
+    torch::Tensor num_tiles, torch::Tensor output,
+    int64_t n, int64_t k, int64_t persistent_ctas) {
+  return grouped_gemm_out_impl(
+      acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
+      expert_residual, expert_offsets, token_counts, token_scales,
+      tile_experts, tile_n, num_tiles, output, n, k, persistent_ctas, true);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("preprocess_weight", &preprocess_weight,
              "Preprocess raw MXFP4 weights for LowLatencyGroupedGEMM");
   module.def("grouped_gemm_out", &grouped_gemm_out,
              "Run LowLatencyGroupedGEMM into caller-owned graph-safe buffers");
+  module.def("grouped_gemm_out_precomputed_counts",
+             &grouped_gemm_out_precomputed_counts,
+             "Run LowLatencyGroupedGEMM with caller-provided expert counts");
 }
