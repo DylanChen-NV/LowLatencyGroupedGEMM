@@ -570,6 +570,18 @@ void launch_low_latency_mxfp4_fp8(
                     4096, 1280><<<
                     opts.persistent_ctas, block, 0, opts.stream>>>(
                     params, row_tiles);
+        } else if (opts.N_orig == 1024 && opts.K == 4096) {
+            low_latency_mxfp4_fp8_detail::
+                low_latency_mxfp4_fp8_device_schedule_kernel<
+                    1024, 4096><<<
+                    opts.persistent_ctas, block, 0, opts.stream>>>(
+                    params, row_tiles);
+        } else if (opts.N_orig == 4096 && opts.K == 512) {
+            low_latency_mxfp4_fp8_detail::
+                low_latency_mxfp4_fp8_device_schedule_kernel<
+                    4096, 512><<<
+                    opts.persistent_ctas, block, 0, opts.stream>>>(
+                    params, row_tiles);
         } else {
             low_latency_mxfp4_fp8_detail::
                 low_latency_mxfp4_fp8_device_schedule_kernel<><<<
@@ -590,6 +602,14 @@ void launch_low_latency_mxfp4_fp8(
     } else if (opts.N_orig == 4096 && opts.K == 1280) {
         low_latency_mxfp4_fp8_detail::
             low_latency_mxfp4_fp8_kernel<4096, 1280><<<
+                grid, block, 0, opts.stream>>>(params);
+    } else if (opts.N_orig == 1024 && opts.K == 4096) {
+        low_latency_mxfp4_fp8_detail::
+            low_latency_mxfp4_fp8_kernel<1024, 4096><<<
+                grid, block, 0, opts.stream>>>(params);
+    } else if (opts.N_orig == 4096 && opts.K == 512) {
+        low_latency_mxfp4_fp8_detail::
+            low_latency_mxfp4_fp8_kernel<4096, 512><<<
                 grid, block, 0, opts.stream>>>(params);
     } else {
         low_latency_mxfp4_fp8_detail::low_latency_mxfp4_fp8_kernel<><<<
