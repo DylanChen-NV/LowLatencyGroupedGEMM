@@ -73,7 +73,8 @@ torch::Tensor grouped_gemm_out_impl(
     torch::Tensor num_tiles, torch::Tensor output,
     int64_t n, int64_t k, int64_t persistent_ctas,
     bool token_counts_are_precomputed,
-    bool tile_schedule_is_precomputed) {
+    bool tile_schedule_is_precomputed,
+    bool token_scales_are_precombined) {
   for (const auto& item : {
            std::pair<const torch::Tensor*, const char*>{&acts, "acts"},
            {&activation_scales, "activation_scales"},
@@ -127,10 +128,12 @@ torch::Tensor grouped_gemm_out_impl(
         expert_offsets.data_ptr<int32_t>(), token_counts.data_ptr<int32_t>(),
         experts);
   }
-  mga::launch_low_latency_mxfp4_fp8_combine_token_scales(
-      activation_scales.data_ptr<float>(), expert_residual.data_ptr<float>(),
-      expert_offsets.data_ptr<int32_t>(), token_scales.data_ptr<float>(),
-      experts, stream);
+  if (!token_scales_are_precombined) {
+    mga::launch_low_latency_mxfp4_fp8_combine_token_scales(
+        activation_scales.data_ptr<float>(), expert_residual.data_ptr<float>(),
+        expert_offsets.data_ptr<int32_t>(), token_scales.data_ptr<float>(),
+        experts, stream);
+  }
 
   mga::LowLatencyMxfp4Fp8LaunchOpts launch{};
   launch.G = experts;
@@ -140,7 +143,9 @@ torch::Tensor grouped_gemm_out_impl(
   launch.acts = reinterpret_cast<const __nv_fp8_e4m3*>(acts.data_ptr());
   launch.w_interleaved = interleaved_weight.data_ptr<uint8_t>();
   launch.exp_offsets_interleaved = interleaved_exp_offsets.data_ptr<uint8_t>();
-  launch.token_scales = token_scales.data_ptr<float>();
+  launch.token_scales =
+      (token_scales_are_precombined ? activation_scales : token_scales)
+          .data_ptr<float>();
   launch.token_counts = token_counts.data_ptr<int32_t>();
   launch.expert_offsets = expert_offsets.data_ptr<int32_t>();
   launch.tile_experts = tile_experts.data_ptr<int32_t>();
@@ -169,7 +174,7 @@ torch::Tensor grouped_gemm_out(
       acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
       expert_residual, expert_offsets, token_counts, token_scales,
       tile_experts, tile_n, num_tiles, output, n, k, persistent_ctas, false,
-      false);
+      false, false);
 }
 
 torch::Tensor grouped_gemm_out_precomputed_counts(
@@ -184,7 +189,7 @@ torch::Tensor grouped_gemm_out_precomputed_counts(
       acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
       expert_residual, expert_offsets, token_counts, token_scales,
       tile_experts, tile_n, num_tiles, output, n, k, persistent_ctas, true,
-      false);
+      false, false);
 }
 
 torch::Tensor grouped_gemm_out_precomputed_schedule(
@@ -199,7 +204,22 @@ torch::Tensor grouped_gemm_out_precomputed_schedule(
       acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
       expert_residual, expert_offsets, token_counts, token_scales,
       tile_experts, tile_n, num_tiles, output, n, k, persistent_ctas, true,
-      true);
+      true, false);
+}
+
+torch::Tensor grouped_gemm_out_precomputed_schedule_and_scales(
+    torch::Tensor acts, torch::Tensor activation_scales,
+    torch::Tensor interleaved_weight, torch::Tensor interleaved_exp_offsets,
+    torch::Tensor expert_residual, torch::Tensor expert_offsets,
+    torch::Tensor token_counts, torch::Tensor token_scales,
+    torch::Tensor tile_experts, torch::Tensor tile_n,
+    torch::Tensor num_tiles, torch::Tensor output,
+    int64_t n, int64_t k, int64_t persistent_ctas) {
+  return grouped_gemm_out_impl(
+      acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
+      expert_residual, expert_offsets, token_counts, token_scales,
+      tile_experts, tile_n, num_tiles, output, n, k, persistent_ctas, true,
+      true, true);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
@@ -213,4 +233,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("grouped_gemm_out_precomputed_schedule",
              &grouped_gemm_out_precomputed_schedule,
              "Run LowLatencyGroupedGEMM with a caller-provided schedule");
+  module.def("grouped_gemm_out_precomputed_schedule_and_scales",
+             &grouped_gemm_out_precomputed_schedule_and_scales,
+             "Run LowLatencyGroupedGEMM with precombined token scales");
 }
