@@ -86,7 +86,8 @@ std::vector<torch::Tensor> prepare_deepep_layout_out(
               "padded_offsets must have experts + 1 entries");
   TORCH_CHECK(compact_offsets.numel() == experts + 1,
               "compact_offsets must have experts + 1 entries");
-  TORCH_CHECK(tile_experts.numel() >= experts * ((capacity + 7) / 8),
+  TORCH_CHECK(tile_experts.numel() >=
+                  experts * ((capacity + 7) / 8),
               "tile_experts capacity is too small");
   TORCH_CHECK(tile_n.numel() >= tile_experts.numel(),
               "tile_n capacity is too small");
@@ -99,6 +100,46 @@ std::vector<torch::Tensor> prepare_deepep_layout_out(
       tile_n.data_ptr<int32_t>(), num_tiles.data_ptr<int32_t>(),
       current_stream(token_counts));
   return {padded_offsets, compact_offsets, num_tiles};
+}
+
+torch::Tensor situ_quant_compact_out(
+    torch::Tensor gate_up, torch::Tensor compact_offsets,
+    torch::Tensor output, torch::Tensor output_scales,
+    double beta, double linear_beta) {
+  for (const auto& item : {
+           std::pair<const torch::Tensor*, const char*>{&gate_up, "gate_up"},
+           {&compact_offsets, "compact_offsets"}, {&output, "output"},
+           {&output_scales, "output_scales"}}) {
+    check_cuda_contiguous(*item.first, item.second);
+  }
+  TORCH_CHECK(gate_up.scalar_type() == torch::kBFloat16,
+              "gate_up must be bfloat16");
+  TORCH_CHECK(output.element_size() == 1,
+              "output must use one-byte FP8 storage");
+  TORCH_CHECK(output_scales.scalar_type() == torch::kFloat32,
+              "output_scales must be float32");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt32 &&
+                  compact_offsets.dim() == 1 && compact_offsets.numel() >= 1,
+              "compact_offsets must be a non-empty int32 vector");
+  TORCH_CHECK(gate_up.dim() == 2 && output.dim() == 2,
+              "gate_up and output must be 2D");
+  const int64_t max_tokens = output.size(0);
+  const int64_t hidden_size = output.size(1);
+  TORCH_CHECK(gate_up.size(0) >= max_tokens &&
+                  gate_up.size(1) == 2 * hidden_size,
+              "gate_up shape must be [max_tokens, 2 * hidden_size]");
+  TORCH_CHECK(output_scales.numel() >= max_tokens,
+              "output_scales capacity is too small");
+  c10::cuda::CUDAGuard device_guard(gate_up.device());
+  mga::launch_low_latency_mxfp4_fp8_situ_quant_compact(
+      reinterpret_cast<const __nv_bfloat16*>(
+          gate_up.data_ptr<at::BFloat16>()),
+      compact_offsets.data_ptr<int32_t>(), compact_offsets.numel() - 1,
+      max_tokens, hidden_size, static_cast<float>(beta),
+      static_cast<float>(linear_beta),
+      reinterpret_cast<__nv_fp8_e4m3*>(output.data_ptr()),
+      output_scales.data_ptr<float>(), current_stream(gate_up));
+  return output;
 }
 
 torch::Tensor grouped_gemm_out_impl(
@@ -292,6 +333,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              "Preprocess raw MXFP4 weights for LowLatencyGroupedGEMM");
   module.def("prepare_deepep_layout_out", &prepare_deepep_layout_out,
              "Build padded/compact offsets and the shared device schedule");
+  module.def("situ_quant_compact_out", &situ_quant_compact_out,
+             "Apply compact Kimi K3 SiTU and per-token FP8 quantization");
   module.def("grouped_gemm_out", &grouped_gemm_out,
              "Run LowLatencyGroupedGEMM into caller-owned graph-safe buffers");
   module.def("grouped_gemm_out_precomputed_counts",

@@ -140,6 +140,21 @@ void launch_low_latency_mxfp4_fp8_prepare_deepep_layout(
     int32_t* num_token_tiles,
     cudaStream_t stream);
 
+// Apply Kimi K3 SiTU and one-scale-per-token FP8 quantization to compact
+// FC1 output. Grid capacity stays static for CUDA Graph; compact_offsets[G]
+// determines the dynamic number of valid rows on device.
+void launch_low_latency_mxfp4_fp8_situ_quant_compact(
+    const __nv_bfloat16* gate_up,
+    const int32_t* compact_offsets,
+    int G,
+    int max_tokens,
+    int hidden_size,
+    float beta,
+    float linear_beta,
+    __nv_fp8_e4m3* output,
+    float* output_scales,
+    cudaStream_t stream);
+
 void launch_low_latency_mxfp4_fp8(
     const LowLatencyMxfp4Fp8LaunchOpts& opts);
 

@@ -90,6 +90,35 @@ def main():
         torch.arange(experts + 1, dtype=torch.int32, device=device) * capacity,
     )
     torch.testing.assert_close(compact_offsets, offsets)
+
+    activation_hidden = 256
+    gate_up = torch.randn(
+        padded_tokens, activation_hidden * 2,
+        dtype=torch.bfloat16, device=device
+    )
+    q2 = torch.zeros(
+        padded_tokens, activation_hidden,
+        dtype=torch.float8_e4m3fn, device=device
+    )
+    s2 = torch.full(
+        (padded_tokens, 1), torch.nan, dtype=torch.float32, device=device
+    )
+    low_latency.situ_quant_compact_out(
+        gate_up, compact_offsets, q2, s2, 4.0, 25.0
+    )
+    torch.cuda.synchronize()
+    gate, up = gate_up[:routed_tokens].float().chunk(2, dim=1)
+    reference_activation = (
+        4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
+        * 25.0 * torch.tanh(up / 25.0)
+    )
+    dequant_activation = (
+        q2[:routed_tokens].float() * s2[:routed_tokens].float()
+    )
+    torch.testing.assert_close(
+        dequant_activation, reference_activation, rtol=0.05, atol=0.05
+    )
+    assert torch.count_nonzero(q2[routed_tokens:]) == 0
     for expert in range(experts):
         compact_slice = slice(expert * 3, expert * 3 + 3)
         padded_slice = slice(expert * capacity, expert * capacity + 3)

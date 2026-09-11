@@ -352,6 +352,74 @@ __global__ void prepare_deepep_layout_kernel(
     }
 }
 
+__device__ __forceinline__ float situ_activate(
+    float gate, float up, float beta, float linear_beta) {
+    const float gate_out =
+        beta * tanhf(gate / beta) / (1.0f + expf(-gate));
+    const float up_out = linear_beta * tanhf(up / linear_beta);
+    return gate_out * up_out;
+}
+
+__global__ void situ_quant_compact_kernel(
+    const __nv_bfloat16* gate_up, const int32_t* compact_offsets, int G,
+    int hidden_size, float beta, float linear_beta,
+    __nv_fp8_e4m3* output, float* output_scales) {
+    const int token = blockIdx.x;
+    if (token >= compact_offsets[G]) return;
+    constexpr int kValuesPerThread = 8;
+    float values[kValuesPerThread];
+    float local_max = 0.0f;
+    const size_t input_base =
+        static_cast<size_t>(token) * hidden_size * 2;
+    const int column_base = threadIdx.x * kValuesPerThread;
+#pragma unroll
+    for (int i = 0; i < kValuesPerThread; ++i) {
+        const int column = column_base + i;
+        float value = 0.0f;
+        if (column < hidden_size) {
+            const float gate = __bfloat162float(gate_up[input_base + column]);
+            const float up =
+                __bfloat162float(gate_up[input_base + hidden_size + column]);
+            value = situ_activate(gate, up, beta, linear_beta);
+        }
+        values[i] = value;
+        local_max = fmaxf(local_max, fabsf(value));
+    }
+
+    const unsigned mask = __activemask();
+    for (int delta = 16; delta > 0; delta >>= 1) {
+        local_max = fmaxf(
+            local_max, __shfl_down_sync(mask, local_max, delta));
+    }
+    __shared__ float warp_maxima[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_maxima[warp] = local_max;
+    __syncthreads();
+    if (warp == 0) {
+        const int warp_count = (blockDim.x + 31) / 32;
+        float block_max = lane < warp_count ? warp_maxima[lane] : 0.0f;
+        for (int delta = 16; delta > 0; delta >>= 1) {
+            block_max = fmaxf(
+                block_max, __shfl_down_sync(0xffffffffu, block_max, delta));
+        }
+        if (lane == 0) warp_maxima[0] = block_max;
+    }
+    __syncthreads();
+    const float scale = fmaxf(warp_maxima[0], 1.0e-10f) / 448.0f;
+    const float inv_scale = 1.0f / scale;
+    if (threadIdx.x == 0) output_scales[token] = scale;
+    const size_t output_base = static_cast<size_t>(token) * hidden_size;
+#pragma unroll
+    for (int i = 0; i < kValuesPerThread; ++i) {
+        const int column = column_base + i;
+        if (column < hidden_size) {
+            output[output_base + column] =
+                __nv_fp8_e4m3(values[i] * inv_scale);
+        }
+    }
+}
+
 __global__ void combine_token_scales_kernel(
     const float* activation_dequant,
     const float* residual,
@@ -552,6 +620,27 @@ void launch_low_latency_mxfp4_fp8_prepare_deepep_layout(
     prepare_deepep_layout_kernel<<<1, kThreads, shared_bytes, stream>>>(
         token_counts, G, capacity, padded_offsets, compact_offsets,
         tile_experts, tile_n, num_token_tiles);
+}
+
+void launch_low_latency_mxfp4_fp8_situ_quant_compact(
+    const __nv_bfloat16* gate_up, const int32_t* compact_offsets, int G,
+    int max_tokens, int hidden_size, float beta, float linear_beta,
+    __nv_fp8_e4m3* output, float* output_scales, cudaStream_t stream) {
+    if (G < 0 || max_tokens < 0 || hidden_size <= 0 ||
+        hidden_size % 8 != 0 || hidden_size > 8192) {
+        abort_mxfp4("invalid compact SiTU shape");
+    }
+    if (max_tokens == 0) return;
+    if (!gate_up || !compact_offsets || !output || !output_scales) {
+        abort_mxfp4("null compact SiTU tensor");
+    }
+    if (beta == 0.0f || linear_beta == 0.0f) {
+        abort_mxfp4("SiTU beta values must be non-zero");
+    }
+    const int threads = (hidden_size + 7) / 8;
+    situ_quant_compact_kernel<<<max_tokens, threads, 0, stream>>>(
+        gate_up, compact_offsets, G, hidden_size, beta, linear_beta,
+        output, output_scales);
 }
 
 void launch_low_latency_mxfp4_fp8_combine_token_scales(
