@@ -256,7 +256,9 @@ torch::Tensor grouped_gemm_out_impl(
                   tile_n.numel() >= routed_tokens,
               "tile schedule capacity is too small");
   TORCH_CHECK(num_tiles.numel() >= 1, "num_tiles must have one entry");
-  TORCH_CHECK(output.dim() == 2 && output.size(0) >= routed_tokens &&
+  const int64_t min_output_rows =
+      output_expert_offsets == nullptr ? routed_tokens : 1;
+  TORCH_CHECK(output.dim() == 2 && output.size(0) >= min_output_rows &&
                   output.size(1) == n,
               "output capacity or shape is invalid");
 

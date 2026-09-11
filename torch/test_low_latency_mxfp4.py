@@ -160,16 +160,18 @@ def main():
         padded_tokens, dtype=torch.float32, device=device
     )
     gate_up_pipeline = torch.full(
-        (padded_tokens, n), torch.nan, dtype=torch.bfloat16, device=device
+        (routed_tokens, n), torch.nan, dtype=torch.bfloat16, device=device
     )
     q2_pipeline = torch.zeros(
-        (padded_tokens, intermediate),
+        (routed_tokens, intermediate),
         dtype=torch.float8_e4m3fn, device=device
     )
     q2_pipeline_scales = torch.full(
-        (padded_tokens, 1), torch.nan, dtype=torch.float32, device=device
+        (routed_tokens, 1), torch.nan, dtype=torch.float32, device=device
     )
-    fc2_token_scales = torch.empty_like(fc1_token_scales)
+    fc2_token_scales = torch.empty(
+        routed_tokens, dtype=torch.float32, device=device
+    )
     pipeline_output = torch.full(
         (padded_tokens, k), torch.nan, dtype=torch.bfloat16, device=device
     )
