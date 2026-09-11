@@ -25,7 +25,10 @@ struct LowLatencyMxfp4Fp8LaunchOpts {
     const uint8_t* exp_offsets_interleaved; // uint8, kernel K32/row-tile layout
     const float* token_scales;               // [M_total], act_dequant*residual*64
     const int32_t* token_counts;             // [G]
-    const int32_t* expert_offsets;           // [G+1]
+    const int32_t* expert_offsets;           // [G+1], input/token-scale offsets
+    // Optional independent output row offsets. nullptr preserves the original
+    // compact->compact (or padded->padded) addressing contract.
+    const int32_t* output_expert_offsets = nullptr; // [G+1]
 
     // Compact schedule. Choose exactly one of these contracts:
     //   1. Host-known count: set num_token_tiles > 0 and provide both arrays.

@@ -66,13 +66,47 @@ def main():
     assert result.shape == (routed_tokens, n)
     assert torch.isfinite(result).all()
 
+    # Verify independent input/output expert bases: read a padded carrier and
+    # write the same valid rows into compact expert-major order.
+    capacity = 4
+    padded_tokens = experts * capacity
+    padded_acts = torch.zeros(
+        padded_tokens, k, dtype=torch.float8_e4m3fn, device=device
+    )
+    padded_scales = torch.ones(
+        padded_tokens, 1, dtype=torch.float32, device=device
+    )
+    input_offsets = torch.arange(
+        experts + 1, dtype=torch.int32, device=device
+    ) * capacity
+    for expert in range(experts):
+        compact_slice = slice(expert * 3, expert * 3 + 3)
+        padded_slice = slice(expert * capacity, expert * capacity + 3)
+        padded_acts[padded_slice].copy_(acts[compact_slice])
+        padded_scales[padded_slice].copy_(activation_scale[compact_slice])
+    dual_token_scales = torch.empty(
+        padded_tokens, dtype=torch.float32, device=device
+    )
+    dual_output = torch.full(
+        (padded_tokens, n), torch.nan, dtype=torch.bfloat16, device=device
+    )
+    dual_result = low_latency.grouped_gemm_out_dual_offsets(
+        padded_acts, padded_scales, weight, scale, residual, input_offsets,
+        offsets, counts, dual_token_scales, tile_experts, tile_n, num_tiles,
+        dual_output, n, k, 528
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        dual_result[:routed_tokens], result, rtol=0, atol=0
+    )
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
     graph.replay()
     torch.cuda.synchronize()
     assert torch.isfinite(output).all()
-    print("PASS: finite output and CUDA Graph replay")
+    print("PASS: dual offsets, finite output, and CUDA Graph replay")
 
 
 if __name__ == "__main__":

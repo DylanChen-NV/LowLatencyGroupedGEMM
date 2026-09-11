@@ -137,7 +137,8 @@ struct LowLatencyMxfp4Fp8Kernel {
         const float* ptr_token_scales;
         ElementC* ptr_D;
 
-        const int32_t* offsets;
+        const int32_t* input_offsets;
+        const int32_t* output_offsets;
         const int32_t* tile_experts;
         const int32_t* tile_n;
         int32_t num_token_tiles;
@@ -172,7 +173,8 @@ struct LowLatencyMxfp4Fp8Kernel {
             return;
         }
 
-        const int token_base = params.offsets[batch_idx];
+        const int input_token_base = params.input_offsets[batch_idx];
+        const int output_token_base = params.output_offsets[batch_idx];
         const size_t weight_expert_stride =
             static_cast<size_t>(matrix_m) * matrix_k / 2;
         const size_t offset_expert_stride =
@@ -227,7 +229,7 @@ struct LowLatencyMxfp4Fp8Kernel {
                     load_cached_16(
                         packed_b,
                         params.ptr_B +
-                            static_cast<size_t>(token_base + token) *
+                            static_cast<size_t>(input_token_base + token) *
                                 matrix_k +
                             (k32_base + load_stage) * kMmaK +
                             k_local);
@@ -357,10 +359,10 @@ struct LowLatencyMxfp4Fp8Kernel {
         const int n_CD = n_tile * 8 + t0 * 2;
         if (n_CD < token_count) {
             const float scale0 =
-                params.ptr_token_scales[token_base + n_CD];
+                params.ptr_token_scales[input_token_base + n_CD];
             ElementC* out0 =
                 params.ptr_D +
-                static_cast<size_t>(token_base + n_CD) * matrix_m;
+                static_cast<size_t>(output_token_base + n_CD) * matrix_m;
             out0[row0] = __float2bfloat16(accum0[0] * scale0);
             out0[row1] = __float2bfloat16(accum0[2] * scale0);
             if (has_second_tile) {
@@ -370,7 +372,7 @@ struct LowLatencyMxfp4Fp8Kernel {
 
             if (n_CD + 1 < token_count) {
                 const float scale1 =
-                    params.ptr_token_scales[token_base + n_CD + 1];
+                    params.ptr_token_scales[input_token_base + n_CD + 1];
                 ElementC* out1 = out0 + matrix_m;
                 out1[row0] = __float2bfloat16(accum0[1] * scale1);
                 out1[row1] = __float2bfloat16(accum0[3] * scale1);

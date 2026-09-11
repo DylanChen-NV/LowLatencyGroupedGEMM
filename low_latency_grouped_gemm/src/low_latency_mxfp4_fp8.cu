@@ -349,7 +349,10 @@ Params make_params(const LowLatencyMxfp4Fp8LaunchOpts& opts) {
     params.ptr_exp_offsets = opts.exp_offsets_interleaved;
     params.ptr_token_scales = opts.token_scales;
     params.ptr_D = opts.outs;
-    params.offsets = opts.expert_offsets;
+    params.input_offsets = opts.expert_offsets;
+    params.output_offsets = opts.output_expert_offsets
+        ? opts.output_expert_offsets
+        : opts.expert_offsets;
     params.tile_experts = opts.tile_experts;
     params.tile_n = opts.tile_n;
     params.num_token_tiles = opts.num_token_tiles;

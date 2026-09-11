@@ -71,6 +71,7 @@ torch::Tensor grouped_gemm_out_impl(
     torch::Tensor token_counts, torch::Tensor token_scales,
     torch::Tensor tile_experts, torch::Tensor tile_n,
     torch::Tensor num_tiles, torch::Tensor output,
+    const torch::Tensor* output_expert_offsets,
     int64_t n, int64_t k, int64_t persistent_ctas,
     bool token_counts_are_precomputed,
     bool tile_schedule_is_precomputed,
@@ -87,6 +88,9 @@ torch::Tensor grouped_gemm_out_impl(
            {&tile_experts, "tile_experts"}, {&tile_n, "tile_n"},
            {&num_tiles, "num_tiles"}, {&output, "output"}}) {
     check_cuda_contiguous(*item.first, item.second);
+  }
+  if (output_expert_offsets != nullptr) {
+    check_cuda_contiguous(*output_expert_offsets, "output_expert_offsets");
   }
   TORCH_CHECK(acts.dim() == 2 && acts.size(1) == k,
               "acts must have shape [routed_tokens, K]");
@@ -107,6 +111,12 @@ torch::Tensor grouped_gemm_out_impl(
   const int64_t routed_tokens = acts.size(0);
   TORCH_CHECK(expert_offsets.numel() == experts + 1,
               "expert_offsets must have experts + 1 entries");
+  if (output_expert_offsets != nullptr) {
+    TORCH_CHECK(output_expert_offsets->scalar_type() == torch::kInt32,
+                "output_expert_offsets must be int32");
+    TORCH_CHECK(output_expert_offsets->numel() == experts + 1,
+                "output_expert_offsets must have experts + 1 entries");
+  }
   TORCH_CHECK(token_counts.numel() == experts,
               "token_counts must have one entry per expert");
   TORCH_CHECK(activation_scales.numel() >= routed_tokens,
@@ -148,6 +158,9 @@ torch::Tensor grouped_gemm_out_impl(
           .data_ptr<float>();
   launch.token_counts = token_counts.data_ptr<int32_t>();
   launch.expert_offsets = expert_offsets.data_ptr<int32_t>();
+  launch.output_expert_offsets = output_expert_offsets == nullptr
+      ? nullptr
+      : output_expert_offsets->data_ptr<int32_t>();
   launch.tile_experts = tile_experts.data_ptr<int32_t>();
   launch.tile_n = tile_n.data_ptr<int32_t>();
   launch.num_token_tiles_device = num_tiles.data_ptr<int32_t>();
@@ -173,7 +186,7 @@ torch::Tensor grouped_gemm_out(
   return grouped_gemm_out_impl(
       acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
       expert_residual, expert_offsets, token_counts, token_scales,
-      tile_experts, tile_n, num_tiles, output, n, k, persistent_ctas, false,
+      tile_experts, tile_n, num_tiles, output, nullptr, n, k, persistent_ctas, false,
       false, false);
 }
 
@@ -188,7 +201,7 @@ torch::Tensor grouped_gemm_out_precomputed_counts(
   return grouped_gemm_out_impl(
       acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
       expert_residual, expert_offsets, token_counts, token_scales,
-      tile_experts, tile_n, num_tiles, output, n, k, persistent_ctas, true,
+      tile_experts, tile_n, num_tiles, output, nullptr, n, k, persistent_ctas, true,
       false, false);
 }
 
@@ -203,7 +216,7 @@ torch::Tensor grouped_gemm_out_precomputed_schedule(
   return grouped_gemm_out_impl(
       acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
       expert_residual, expert_offsets, token_counts, token_scales,
-      tile_experts, tile_n, num_tiles, output, n, k, persistent_ctas, true,
+      tile_experts, tile_n, num_tiles, output, nullptr, n, k, persistent_ctas, true,
       true, false);
 }
 
@@ -218,8 +231,23 @@ torch::Tensor grouped_gemm_out_precomputed_schedule_and_scales(
   return grouped_gemm_out_impl(
       acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
       expert_residual, expert_offsets, token_counts, token_scales,
-      tile_experts, tile_n, num_tiles, output, n, k, persistent_ctas, true,
+      tile_experts, tile_n, num_tiles, output, nullptr, n, k, persistent_ctas, true,
       true, true);
+}
+
+torch::Tensor grouped_gemm_out_dual_offsets(
+    torch::Tensor acts, torch::Tensor activation_scales,
+    torch::Tensor interleaved_weight, torch::Tensor interleaved_exp_offsets,
+    torch::Tensor expert_residual, torch::Tensor input_expert_offsets,
+    torch::Tensor output_expert_offsets, torch::Tensor token_counts,
+    torch::Tensor token_scales, torch::Tensor tile_experts,
+    torch::Tensor tile_n, torch::Tensor num_tiles, torch::Tensor output,
+    int64_t n, int64_t k, int64_t persistent_ctas) {
+  return grouped_gemm_out_impl(
+      acts, activation_scales, interleaved_weight, interleaved_exp_offsets,
+      expert_residual, input_expert_offsets, token_counts, token_scales,
+      tile_experts, tile_n, num_tiles, output, &output_expert_offsets,
+      n, k, persistent_ctas, true, false, false);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
@@ -233,6 +261,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("grouped_gemm_out_precomputed_schedule",
              &grouped_gemm_out_precomputed_schedule,
              "Run LowLatencyGroupedGEMM with a caller-provided schedule");
+  module.def("grouped_gemm_out_dual_offsets", &grouped_gemm_out_dual_offsets,
+             "Run LowLatencyGroupedGEMM with independent input/output offsets");
   module.def("grouped_gemm_out_precomputed_schedule_and_scales",
              &grouped_gemm_out_precomputed_schedule_and_scales,
              "Run LowLatencyGroupedGEMM with precombined token scales");
