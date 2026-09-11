@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// MXFP4xFP8 validation/latency matrix:
-//   M={4,8,16,32,44,48,64}, E=128, top-k=6
-//   FC1 N=2560 K=4096; FC2 N=4096 K=1280.
+// Kimi K3 MXFP4xFP8 validation/latency matrix:
+//   M={1,2,4,8}, local E=28 (EP32 over 896 experts), top-k=16
+//   FC1 N=6144 K=3584; FC2 N=3584 K=3072.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -21,9 +21,9 @@
 
 namespace {
 
-constexpr int kExperts = 128;
-constexpr int kTopK = 6;
-constexpr int kBenchmarkM[] = {4, 8, 16, 32, 44, 48, 64};
+constexpr int kExperts = 28;
+constexpr int kTopK = 16;
+constexpr int kBenchmarkM[] = {1, 2, 4, 8};
 // Match the INT4xFP8 direct-GEMM correctness policy.
 constexpr float kCorrectnessAtolFactor = 1e-2f;
 constexpr float kCorrectnessRtol = 5e-2f;
@@ -264,7 +264,7 @@ Options parse_options(int argc, char** argv) {
         bool found = false;
         for (int M : kBenchmarkM) found = found || M == options.only_m;
         if (!found) {
-            std::fprintf(stderr, "--m must be one of 4,8,16,32,44,48,64\n");
+            std::fprintf(stderr, "--m must be one of 1,2,4,8\n");
             std::exit(2);
         }
     }
@@ -277,7 +277,7 @@ public:
         : name_(name),
           N_(N),
           K_(K),
-          max_tokens_(64 * kTopK),
+          max_tokens_(8 * kTopK),
           weight_count_(mga::low_latency_mxfp4_fp8_weight_bytes(
               kExperts, N, K)),
           scale_count_(mga::low_latency_mxfp4_fp8_scale_bytes(
@@ -459,6 +459,10 @@ public:
             launch_.stream);
     }
 
+    void launch_main() {
+        mga::launch_low_latency_mxfp4_fp8(launch_);
+    }
+
     void launch_builder_main() {
         auto combined_launch = launch_;
         combined_launch.build_device_schedule = true;
@@ -523,8 +527,8 @@ int main(int argc, char** argv) {
     for (int M : kBenchmarkM) {
         if (options.only_m == 0 || options.only_m == M) selected_m.push_back(M);
     }
-    BenchmarkStage fc1("FC1", 2560, 4096);
-    BenchmarkStage fc2("FC2", 4096, 1280);
+    BenchmarkStage fc1("FC1", 6144, 3584);
+    BenchmarkStage fc2("FC2", 3584, 3072);
     std::printf(
         "\nPaired FC1+FC2 full-path timing: each loop iteration "
         "contains FC1(reset+builder+main) and FC2(reset+builder+main); "
@@ -534,15 +538,30 @@ int main(int argc, char** argv) {
         const ShapeResult fc2_result = fc2.run_shape(M, options);
         all_correct = fc1_result.correct && fc2_result.correct && all_correct;
 
-        const float builder_main_us = measure_cuda_average_us(
+        const float fc1_main_us = measure_cuda_average_us(
+            [&] { fc1.launch_main(); }, options);
+        const float fc2_main_us = measure_cuda_average_us(
+            [&] { fc2.launch_main(); }, options);
+        const float fc1_builder_main_us = measure_cuda_average_us(
+            [&] { fc1.launch_builder_main(); }, options);
+        const float fc2_builder_main_us = measure_cuda_average_us(
+            [&] { fc2.launch_builder_main(); }, options);
+        const float paired_builder_main_us = measure_cuda_average_us(
             [&] {
                 fc1.launch_builder_main();
                 fc2.launch_builder_main();
             },
             options);
-        std::printf("M=%-2d paired_builder_main_us=%.3f\n",
-                    M,
-                    builder_main_us);
+        std::printf(
+            "M=%-2d fc1_main_us=%.3f fc2_main_us=%.3f "
+            "fc1_builder_main_us=%.3f fc2_builder_main_us=%.3f "
+            "paired_builder_main_us=%.3f\n",
+            M,
+            fc1_main_us,
+            fc2_main_us,
+            fc1_builder_main_us,
+            fc2_builder_main_us,
+            paired_builder_main_us);
     }
     std::printf("RESULT=%s\n", all_correct ? "PASS" : "FAIL");
     return all_correct ? 0 : 1;
