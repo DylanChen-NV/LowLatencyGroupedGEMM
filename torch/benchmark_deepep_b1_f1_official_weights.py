@@ -6,6 +6,8 @@ from safetensors import safe_open
 
 import low_latency_mxfp4 as llop
 from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import situ_and_mul
+from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
 
 E = 28
@@ -85,6 +87,12 @@ with safe_open(SHARD, framework="pt", device="cpu") as handle:
 
 raw_w13 = torch.cat((raw_w1, raw_w3), dim=1).contiguous()
 raw_s13 = torch.cat((raw_s1, raw_s3), dim=1).contiguous()
+dense_w13 = upcast_from_mxfp(
+    raw_w13, raw_s13, target_dtype=torch.bfloat16, axis=-1
+)
+dense_w2 = upcast_from_mxfp(
+    raw_w2, raw_s2, target_dtype=torch.bfloat16, axis=-1
+)
 w13, w13_off, w13_res = llop.preprocess_weight(raw_w13, raw_s13)
 w2, w2_off, w2_res = llop.preprocess_weight(raw_w2, raw_s2)
 del raw_w1, raw_s1, raw_w3, raw_s3, raw_w13, raw_s13, raw_w2, raw_s2
@@ -209,6 +217,21 @@ for _ in range(5):
     f1_full_post_dispatch()
 torch.cuda.synchronize()
 
+reference_out = torch.zeros_like(b1["out"])
+for expert in range(E):
+    count = int(counts[expert].item())
+    gate_up = torch.matmul(
+        hidden[expert, :count], dense_w13[expert].transpose(0, 1)
+    )
+    activated = torch.empty(
+        (count, I), dtype=torch.bfloat16, device=device
+    )
+    situ_and_mul(activated, gate_up, BETA, LINEAR_BETA)
+    reference_out[expert * CAP : expert * CAP + count] = torch.matmul(
+        activated, dense_w2[expert].transpose(0, 1)
+    )
+torch.cuda.synchronize()
+
 a = b1["out"][valid].float()
 b = f1["out"][valid].float()
 diff = a - b
@@ -257,6 +280,10 @@ input_quantization = {
     "f1_requant_vs_deepep_group128": error_metrics(
         group_dequant_valid, f1_input_dequant
     ),
+}
+official_weight_reference = {
+    "b1_vs_bf16_upcast": error_metrics(reference_out[valid].float(), a),
+    "f1_vs_bf16_upcast": error_metrics(reference_out[valid].float(), b),
 }
 
 
@@ -326,6 +353,7 @@ result = {
     },
     "correctness": correctness,
     "input_quantization": input_quantization,
+    "official_weight_reference": official_weight_reference,
     "latency_us": latency_us,
     "speedup": {"b1_over_f1_full_post_dispatch": b1_full / f1_full},
     "reduction_percent": {"full_post_dispatch": 100.0 * (b1_full - f1_full) / b1_full},
