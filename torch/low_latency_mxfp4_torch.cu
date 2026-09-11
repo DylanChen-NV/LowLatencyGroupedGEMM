@@ -328,6 +328,37 @@ torch::Tensor grouped_gemm_out_dual_offsets(
       n, k, persistent_ctas, true, false, false);
 }
 
+torch::Tensor deepep_moe_out(
+    torch::Tensor q1, torch::Tensor q1_scales,
+    torch::Tensor w13, torch::Tensor w13_exp_offsets,
+    torch::Tensor w13_residual, torch::Tensor w2,
+    torch::Tensor w2_exp_offsets, torch::Tensor w2_residual,
+    torch::Tensor masked_m, torch::Tensor padded_offsets,
+    torch::Tensor compact_offsets, torch::Tensor tile_experts,
+    torch::Tensor tile_n, torch::Tensor num_tiles,
+    torch::Tensor fc1_token_scales, torch::Tensor gate_up,
+    torch::Tensor q2, torch::Tensor q2_scales,
+    torch::Tensor fc2_token_scales, torch::Tensor output,
+    int64_t capacity, int64_t hidden_size, int64_t intermediate_size,
+    int64_t persistent_ctas, double beta, double linear_beta) {
+  prepare_deepep_layout_out(
+      masked_m, capacity, padded_offsets, compact_offsets, tile_experts,
+      tile_n, num_tiles);
+  grouped_gemm_out_impl(
+      q1, q1_scales, w13, w13_exp_offsets, w13_residual, padded_offsets,
+      masked_m, fc1_token_scales, tile_experts, tile_n, num_tiles, gate_up,
+      &compact_offsets, 2 * intermediate_size, hidden_size, persistent_ctas,
+      true, true, false);
+  situ_quant_compact_out(
+      gate_up, compact_offsets, q2, q2_scales, beta, linear_beta);
+  grouped_gemm_out_impl(
+      q2, q2_scales, w2, w2_exp_offsets, w2_residual, compact_offsets,
+      masked_m, fc2_token_scales, tile_experts, tile_n, num_tiles, output,
+      &padded_offsets, hidden_size, intermediate_size, persistent_ctas,
+      true, true, false);
+  return output;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("preprocess_weight", &preprocess_weight,
              "Preprocess raw MXFP4 weights for LowLatencyGroupedGEMM");
@@ -335,6 +366,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              "Build padded/compact offsets and the shared device schedule");
   module.def("situ_quant_compact_out", &situ_quant_compact_out,
              "Apply compact Kimi K3 SiTU and per-token FP8 quantization");
+  module.def("deepep_moe_out", &deepep_moe_out,
+             "Run the graph-safe DeepEP padded-to-compact MXFP4 MoE pipeline");
   module.def("grouped_gemm_out", &grouped_gemm_out,
              "Run LowLatencyGroupedGEMM into caller-owned graph-safe buffers");
   module.def("grouped_gemm_out_precomputed_counts",

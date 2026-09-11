@@ -140,6 +140,66 @@ def main():
         dual_result[:routed_tokens], result, rtol=0, atol=0
     )
 
+    intermediate = n / 2
+    raw_w2 = torch.randint(
+        0, 256, (experts, k, intermediate / 2),
+        dtype=torch.uint8, device=device
+    )
+    raw_s2 = torch.randint(
+        120, 133, (experts, k, intermediate / 32),
+        dtype=torch.uint8, device=device
+    )
+    w2, w2_offsets, w2_residual = low_latency.preprocess_weight(
+        raw_w2, raw_s2
+    )
+    fc1_token_scales = torch.empty(
+        padded_tokens, dtype=torch.float32, device=device
+    )
+    gate_up_pipeline = torch.full(
+        (padded_tokens, n), torch.nan, dtype=torch.bfloat16, device=device
+    )
+    q2_pipeline = torch.zeros(
+        (padded_tokens, intermediate),
+        dtype=torch.float8_e4m3fn, device=device
+    )
+    q2_pipeline_scales = torch.full(
+        (padded_tokens, 1), torch.nan, dtype=torch.float32, device=device
+    )
+    fc2_token_scales = torch.empty_like(fc1_token_scales)
+    pipeline_output = torch.full(
+        (padded_tokens, k), torch.nan, dtype=torch.bfloat16, device=device
+    )
+    low_latency.deepep_moe_out(
+        padded_acts, padded_scales, weight, scale, residual, w2, w2_offsets,
+        w2_residual, counts, input_offsets, compact_offsets, tile_experts,
+        tile_n, num_tiles, fc1_token_scales, gate_up_pipeline, q2_pipeline,
+        q2_pipeline_scales, fc2_token_scales, pipeline_output, capacity, k,
+        intermediate, 528, 4.0, 25.0
+    )
+    torch.cuda.synchronize()
+    valid = torch.cat([
+        torch.arange(expert * capacity, expert * capacity + 3, device=device)
+        for expert in range(experts)
+    ])
+    padding = torch.cat([
+        torch.arange(expert * capacity + 3, (expert + 1) * capacity, device=device)
+        for expert in range(experts)
+    ])
+    assert torch.isfinite(pipeline_output[valid]).all()
+    assert torch.isnan(pipeline_output[padding]).all()
+    pipeline_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(pipeline_graph):
+        low_latency.deepep_moe_out(
+            padded_acts, padded_scales, weight, scale, residual, w2, w2_offsets,
+            w2_residual, counts, input_offsets, compact_offsets, tile_experts,
+            tile_n, num_tiles, fc1_token_scales, gate_up_pipeline, q2_pipeline,
+            q2_pipeline_scales, fc2_token_scales, pipeline_output, capacity, k,
+            intermediate, 528, 4.0, 25.0
+        )
+    pipeline_graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isfinite(pipeline_output[valid]).all()
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
