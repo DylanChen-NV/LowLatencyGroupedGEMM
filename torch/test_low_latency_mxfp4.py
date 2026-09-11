@@ -140,7 +140,7 @@ def main():
         dual_result[:routed_tokens], result, rtol=0, atol=0
     )
 
-    intermediate = n / 2
+    intermediate = n // 2
     raw_w2 = torch.randint(
         0, 256, (experts, k, intermediate / 2),
         dtype=torch.uint8, device=device
