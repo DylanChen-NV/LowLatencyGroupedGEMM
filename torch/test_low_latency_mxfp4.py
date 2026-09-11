@@ -142,11 +142,11 @@ def main():
 
     intermediate = n // 2
     raw_w2 = torch.randint(
-        0, 256, (experts, k, intermediate / 2),
+        0, 256, (experts, k, intermediate // 2),
         dtype=torch.uint8, device=device
     )
     raw_s2 = torch.randint(
-        120, 133, (experts, k, intermediate / 32),
+        120, 133, (experts, k, intermediate // 32),
         dtype=torch.uint8, device=device
     )
     w2, w2_offsets, w2_residual = low_latency.preprocess_weight(
