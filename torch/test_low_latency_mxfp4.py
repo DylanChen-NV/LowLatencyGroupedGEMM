@@ -70,6 +70,10 @@ def main():
     # write the same valid rows into compact expert-major order.
     capacity = 4
     padded_tokens = experts * capacity
+    tile_experts = torch.empty(
+        padded_tokens, dtype=torch.int32, device=device
+    )
+    tile_n = torch.empty_like(tile_experts)
     padded_acts = torch.zeros(
         padded_tokens, k, dtype=torch.float8_e4m3fn, device=device
     )
