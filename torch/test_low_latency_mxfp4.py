@@ -76,9 +76,20 @@ def main():
     padded_scales = torch.ones(
         padded_tokens, 1, dtype=torch.float32, device=device
     )
-    input_offsets = torch.arange(
+    input_offsets = torch.empty(
         experts + 1, dtype=torch.int32, device=device
-    ) * capacity
+    )
+    compact_offsets = torch.empty_like(input_offsets)
+    low_latency.prepare_deepep_layout_out(
+        counts, capacity, input_offsets, compact_offsets, tile_experts,
+        tile_n, num_tiles
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        input_offsets,
+        torch.arange(experts + 1, dtype=torch.int32, device=device) * capacity,
+    )
+    torch.testing.assert_close(compact_offsets, offsets)
     for expert in range(experts):
         compact_slice = slice(expert * 3, expert * 3 + 3)
         padded_slice = slice(expert * capacity, expert * capacity + 3)
@@ -92,7 +103,7 @@ def main():
     )
     dual_result = low_latency.grouped_gemm_out_dual_offsets(
         padded_acts, padded_scales, weight, scale, residual, input_offsets,
-        offsets, counts, dual_token_scales, tile_experts, tile_n, num_tiles,
+        compact_offsets, counts, dual_token_scales, tile_experts, tile_n, num_tiles,
         dual_output, n, k, 528
     )
     torch.cuda.synchronize()

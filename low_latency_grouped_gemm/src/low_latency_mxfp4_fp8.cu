@@ -319,6 +319,39 @@ __global__ void interleave_kernel(
     }
 }
 
+__global__ void prepare_deepep_layout_kernel(
+    const int32_t* token_counts, int G, int capacity,
+    int32_t* padded_offsets, int32_t* compact_offsets,
+    int32_t* tile_experts, int32_t* tile_n, int32_t* num_token_tiles) {
+    extern __shared__ int32_t scratch[];
+    int32_t* compact = scratch;
+    int32_t* tile_offsets = compact + G + 1;
+    if (threadIdx.x == 0) {
+        compact[0] = 0;
+        tile_offsets[0] = 0;
+        padded_offsets[0] = 0;
+        compact_offsets[0] = 0;
+        for (int expert = 0; expert < G; ++expert) {
+            const int count = token_counts[expert];
+            compact[expert + 1] = compact[expert] + count;
+            tile_offsets[expert + 1] =
+                tile_offsets[expert] + (count + 7) / 8;
+            padded_offsets[expert + 1] = (expert + 1) * capacity;
+            compact_offsets[expert + 1] = compact[expert + 1];
+        }
+        *num_token_tiles = tile_offsets[G];
+    }
+    __syncthreads();
+    for (int expert = threadIdx.x; expert < G; expert += blockDim.x) {
+        const int begin = tile_offsets[expert];
+        const int end = tile_offsets[expert + 1];
+        for (int tile = begin; tile < end; ++tile) {
+            tile_experts[tile] = expert;
+            tile_n[tile] = tile - begin;
+        }
+    }
+}
+
 __global__ void combine_token_scales_kernel(
     const float* activation_dequant,
     const float* residual,
@@ -491,6 +524,34 @@ void launch_low_latency_mxfp4_fp8_preprocess_weight(
         N_orig,
         K,
         stream);
+}
+
+void launch_low_latency_mxfp4_fp8_prepare_deepep_layout(
+    const int32_t* token_counts, int G, int capacity,
+    int tile_schedule_capacity, int32_t* padded_offsets,
+    int32_t* compact_offsets, int32_t* tile_experts, int32_t* tile_n,
+    int32_t* num_token_tiles, cudaStream_t stream) {
+    if (G < 0 || capacity < 0) abort_mxfp4("invalid DeepEP layout shape");
+    if (G == 0) {
+        if (num_token_tiles) check_cuda(cudaMemsetAsync(
+            num_token_tiles, 0, sizeof(int32_t), stream),
+            "failed to reset empty tile count");
+        return;
+    }
+    if (!token_counts || !padded_offsets || !compact_offsets ||
+        !tile_experts || !tile_n || !num_token_tiles) {
+        abort_mxfp4("null DeepEP layout tensor");
+    }
+    const int required_capacity = G * ((capacity + 7) / 8);
+    if (tile_schedule_capacity < required_capacity) {
+        abort_mxfp4("DeepEP tile schedule capacity is too small");
+    }
+    constexpr int kThreads = 256;
+    const size_t shared_bytes =
+        static_cast<size_t>(2 * (G + 1)) * sizeof(int32_t);
+    prepare_deepep_layout_kernel<<<1, kThreads, shared_bytes, stream>>>(
+        token_counts, G, capacity, padded_offsets, compact_offsets,
+        tile_experts, tile_n, num_token_tiles);
 }
 
 void launch_low_latency_mxfp4_fp8_combine_token_scales(

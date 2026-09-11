@@ -126,6 +126,20 @@ void launch_low_latency_mxfp4_fp8_combine_token_scales(
     int G,
     cudaStream_t stream);
 
+// Build DeepEP padded and compact expert row offsets plus the shared 8-token
+// GEMM tile schedule in one graph-safe device launch.
+void launch_low_latency_mxfp4_fp8_prepare_deepep_layout(
+    const int32_t* token_counts,
+    int G,
+    int capacity,
+    int tile_schedule_capacity,
+    int32_t* padded_offsets,
+    int32_t* compact_offsets,
+    int32_t* tile_experts,
+    int32_t* tile_n,
+    int32_t* num_token_tiles,
+    cudaStream_t stream);
+
 void launch_low_latency_mxfp4_fp8(
     const LowLatencyMxfp4Fp8LaunchOpts& opts);
 

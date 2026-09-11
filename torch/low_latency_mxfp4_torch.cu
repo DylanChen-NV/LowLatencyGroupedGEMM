@@ -64,6 +64,43 @@ std::vector<torch::Tensor> preprocess_weight(
   return {interleaved, interleaved_offsets, residual};
 }
 
+std::vector<torch::Tensor> prepare_deepep_layout_out(
+    torch::Tensor token_counts, int64_t capacity,
+    torch::Tensor padded_offsets, torch::Tensor compact_offsets,
+    torch::Tensor tile_experts, torch::Tensor tile_n,
+    torch::Tensor num_tiles) {
+  for (const auto& item : {
+           std::pair<const torch::Tensor*, const char*>{&token_counts, "token_counts"},
+           {&padded_offsets, "padded_offsets"},
+           {&compact_offsets, "compact_offsets"},
+           {&tile_experts, "tile_experts"}, {&tile_n, "tile_n"},
+           {&num_tiles, "num_tiles"}}) {
+    check_cuda_contiguous(*item.first, item.second);
+    TORCH_CHECK(item.first->scalar_type() == torch::kInt32,
+                item.second, " must be int32");
+  }
+  TORCH_CHECK(token_counts.dim() == 1, "token_counts must be 1D");
+  TORCH_CHECK(capacity >= 0, "capacity must be non-negative");
+  const int experts = token_counts.numel();
+  TORCH_CHECK(padded_offsets.numel() == experts + 1,
+              "padded_offsets must have experts + 1 entries");
+  TORCH_CHECK(compact_offsets.numel() == experts + 1,
+              "compact_offsets must have experts + 1 entries");
+  TORCH_CHECK(tile_experts.numel() >= experts * ((capacity + 7) / 8),
+              "tile_experts capacity is too small");
+  TORCH_CHECK(tile_n.numel() >= tile_experts.numel(),
+              "tile_n capacity is too small");
+  TORCH_CHECK(num_tiles.numel() >= 1, "num_tiles must have one entry");
+  c10::cuda::CUDAGuard device_guard(token_counts.device());
+  mga::launch_low_latency_mxfp4_fp8_prepare_deepep_layout(
+      token_counts.data_ptr<int32_t>(), experts, static_cast<int>(capacity),
+      tile_experts.numel(), padded_offsets.data_ptr<int32_t>(),
+      compact_offsets.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
+      tile_n.data_ptr<int32_t>(), num_tiles.data_ptr<int32_t>(),
+      current_stream(token_counts));
+  return {padded_offsets, compact_offsets, num_tiles};
+}
+
 torch::Tensor grouped_gemm_out_impl(
     torch::Tensor acts, torch::Tensor activation_scales,
     torch::Tensor interleaved_weight, torch::Tensor interleaved_exp_offsets,
@@ -253,6 +290,8 @@ torch::Tensor grouped_gemm_out_dual_offsets(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("preprocess_weight", &preprocess_weight,
              "Preprocess raw MXFP4 weights for LowLatencyGroupedGEMM");
+  module.def("prepare_deepep_layout_out", &prepare_deepep_layout_out,
+             "Build padded/compact offsets and the shared device schedule");
   module.def("grouped_gemm_out", &grouped_gemm_out,
              "Run LowLatencyGroupedGEMM into caller-owned graph-safe buffers");
   module.def("grouped_gemm_out_precomputed_counts",
