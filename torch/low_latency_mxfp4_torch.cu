@@ -302,7 +302,9 @@ torch::Tensor grouped_gemm_out_impl(
       reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
   launch.stream = stream;
   mga::launch_low_latency_mxfp4_fp8(launch);
-  return output.narrow(0, 0, routed_tokens);
+  return output_expert_offsets == nullptr
+      ? output.narrow(0, 0, routed_tokens)
+      : output;
 }
 }  // namespace
 
