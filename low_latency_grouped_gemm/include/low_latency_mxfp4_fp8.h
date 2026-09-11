@@ -140,6 +140,25 @@ void launch_low_latency_mxfp4_fp8_prepare_deepep_layout(
     int32_t* num_token_tiles,
     cudaStream_t stream);
 
+// Convert DeepEP's padded E4M3 + group-128 FP32-scale carrier into compact
+// E4M3 rows with one scale per token. Only masked valid prefixes are touched.
+// Scale strides are expressed in elements because DeepEP may return its last
+// two scale dimensions in a column-major layout.
+void launch_low_latency_mxfp4_fp8_requantize_deepep_compact(
+    const __nv_fp8_e4m3* input,
+    const float* input_group_scales,
+    const int32_t* token_counts,
+    const int32_t* compact_offsets,
+    int G,
+    int capacity,
+    int hidden_size,
+    int64_t scale_stride_expert,
+    int64_t scale_stride_token,
+    int64_t scale_stride_group,
+    __nv_fp8_e4m3* output,
+    float* output_scales,
+    cudaStream_t stream);
+
 // Apply Kimi K3 SiTU and one-scale-per-token FP8 quantization to compact
 // FC1 output. Grid capacity stays static for CUDA Graph; compact_offsets[G]
 // determines the dynamic number of valid rows on device.

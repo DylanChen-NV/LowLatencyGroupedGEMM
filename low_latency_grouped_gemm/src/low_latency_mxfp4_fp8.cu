@@ -352,6 +352,64 @@ __global__ void prepare_deepep_layout_kernel(
     }
 }
 
+__global__ void requantize_deepep_compact_kernel(
+    const __nv_fp8_e4m3* input, const float* input_group_scales,
+    const int32_t* token_counts, const int32_t* compact_offsets,
+    int G, int capacity, int hidden_size, int64_t scale_stride_expert,
+    int64_t scale_stride_token, int64_t scale_stride_group,
+    __nv_fp8_e4m3* output, float* output_scales) {
+    const int padded_row = blockIdx.x;
+    const int expert = padded_row / capacity;
+    const int local_row = padded_row - expert * capacity;
+    if (expert >= G || local_row >= token_counts[expert]) return;
+
+    const int groups = hidden_size / 128;
+    const int64_t scale_base =
+        static_cast<int64_t>(expert) * scale_stride_expert +
+        static_cast<int64_t>(local_row) * scale_stride_token;
+    float local_max_scale = 0.0f;
+    for (int group = threadIdx.x; group < groups; group += blockDim.x) {
+        local_max_scale = fmaxf(
+            local_max_scale,
+            input_group_scales[scale_base + group * scale_stride_group]);
+    }
+    const unsigned mask = __activemask();
+    for (int delta = 16; delta > 0; delta >>= 1) {
+        local_max_scale = fmaxf(
+            local_max_scale,
+            __shfl_down_sync(mask, local_max_scale, delta));
+    }
+    __shared__ float warp_maxima[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_maxima[warp] = local_max_scale;
+    __syncthreads();
+    if (warp == 0) {
+        float block_max = lane < 8 ? warp_maxima[lane] : 0.0f;
+        for (int delta = 16; delta > 0; delta >>= 1) {
+            block_max = fmaxf(
+                block_max, __shfl_down_sync(0xffffffffu, block_max, delta));
+        }
+        if (lane == 0) warp_maxima[0] = block_max;
+    }
+    __syncthreads();
+
+    const float token_scale = warp_maxima[0];
+    const int compact_row = compact_offsets[expert] + local_row;
+    if (threadIdx.x == 0) output_scales[compact_row] = token_scale;
+    const size_t input_base = static_cast<size_t>(padded_row) * hidden_size;
+    const size_t output_base = static_cast<size_t>(compact_row) * hidden_size;
+    for (int column = threadIdx.x; column < hidden_size; column += blockDim.x) {
+        const int group = column / 128;
+        const float group_scale =
+            input_group_scales[scale_base + group * scale_stride_group];
+        const float ratio = token_scale == 0.0f ? 0.0f : group_scale / token_scale;
+        const float value = static_cast<float>(input[input_base + column]) * ratio;
+        output[output_base + column] = __nv_fp8_e4m3(
+            fmaxf(fminf(value, 448.0f), -448.0f));
+    }
+}
+
 __device__ __forceinline__ float situ_activate(
     float gate, float up, float beta, float linear_beta) {
     const float gate_out =
@@ -622,6 +680,27 @@ void launch_low_latency_mxfp4_fp8_prepare_deepep_layout(
     prepare_deepep_layout_kernel<<<1, kThreads, shared_bytes, stream>>>(
         token_counts, G, capacity, padded_offsets, compact_offsets,
         tile_experts, tile_n, num_token_tiles);
+}
+
+void launch_low_latency_mxfp4_fp8_requantize_deepep_compact(
+    const __nv_fp8_e4m3* input, const float* input_group_scales,
+    const int32_t* token_counts, const int32_t* compact_offsets,
+    int G, int capacity, int hidden_size, int64_t scale_stride_expert,
+    int64_t scale_stride_token, int64_t scale_stride_group,
+    __nv_fp8_e4m3* output, float* output_scales, cudaStream_t stream) {
+    if (G < 0 || capacity < 0 || hidden_size <= 0 || hidden_size % 128 != 0) {
+        abort_mxfp4("invalid DeepEP FP8 requantize shape");
+    }
+    if (G == 0 || capacity == 0) return;
+    if (!input || !input_group_scales || !token_counts || !compact_offsets ||
+        !output || !output_scales) {
+        abort_mxfp4("null DeepEP FP8 requantize tensor");
+    }
+    constexpr int kThreads = 256;
+    requantize_deepep_compact_kernel<<<G * capacity, kThreads, 0, stream>>>(
+        input, input_group_scales, token_counts, compact_offsets, G, capacity,
+        hidden_size, scale_stride_expert, scale_stride_token,
+        scale_stride_group, output, output_scales);
 }
 
 void launch_low_latency_mxfp4_fp8_situ_quant_compact(
