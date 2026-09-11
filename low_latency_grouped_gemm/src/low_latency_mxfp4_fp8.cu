@@ -380,7 +380,8 @@ __global__ void situ_quant_compact_kernel(
             const float gate = __bfloat162float(gate_up[input_base + column]);
             const float up =
                 __bfloat162float(gate_up[input_base + hidden_size + column]);
-            value = situ_activate(gate, up, beta, linear_beta);
+            value = __bfloat162float(__float2bfloat16(
+                situ_activate(gate, up, beta, linear_beta)));
         }
         values[i] = value;
         local_max = fmaxf(local_max, fabsf(value));
@@ -406,8 +407,8 @@ __global__ void situ_quant_compact_kernel(
         if (lane == 0) warp_maxima[0] = block_max;
     }
     __syncthreads();
-    const float scale = fmaxf(warp_maxima[0], 1.0e-10f) / 448.0f;
-    const float inv_scale = 1.0f / scale;
+    const float scale = warp_maxima[0] / 448.0f;
+    const float inv_scale = scale == 0.0f ? 0.0f : 1.0f / scale;
     if (threadIdx.x == 0) output_scales[token] = scale;
     const size_t output_base = static_cast<size_t>(token) * hidden_size;
 #pragma unroll
@@ -415,7 +416,8 @@ __global__ void situ_quant_compact_kernel(
         const int column = column_base + i;
         if (column < hidden_size) {
             output[output_base + column] =
-                __nv_fp8_e4m3(values[i] * inv_scale);
+                __nv_fp8_e4m3(fmaxf(
+                    fminf(values[i] * inv_scale, 448.0f), -448.0f));
         }
     }
 }
