@@ -196,6 +196,42 @@ correctness = {
 }
 
 
+def error_metrics(reference, actual):
+    delta = reference - actual
+    return {
+        "relative_l2": float(
+            torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(reference)
+        ),
+        "cosine": float(
+            torch.nn.functional.cosine_similarity(
+                reference.flatten(), actual.flatten(), dim=0
+            )
+        ),
+        "max_abs": float(delta.abs().max()),
+    }
+
+
+hidden_valid = hidden_flat[valid].float()
+b1_input_dequant = b1["q1"][valid].float() * b1["q1s"][valid]
+group_dequant_padded = (
+    recv_q.view(E, CAP, H // 128, 128).float()
+    * group_scales_contiguous.unsqueeze(-1)
+).view(ROWS, H)
+group_dequant_valid = group_dequant_padded[valid]
+valid_rows = int(counts.sum())
+f1_input_dequant = (
+    f1["q1"][:valid_rows].float() * f1["q1s"][:valid_rows]
+)
+input_quantization = {
+    "b1_per_token_vs_bf16": error_metrics(hidden_valid, b1_input_dequant),
+    "deepep_group128_vs_bf16": error_metrics(hidden_valid, group_dequant_valid),
+    "f1_requant_vs_bf16": error_metrics(hidden_valid, f1_input_dequant),
+    "f1_requant_vs_deepep_group128": error_metrics(
+        group_dequant_valid, f1_input_dequant
+    ),
+}
+
+
 def capture(fn):
     for _ in range(3):
         fn()
@@ -256,6 +292,7 @@ result = {
         "persistent_ctas": PERSISTENT_CTAS,
     },
     "correctness": correctness,
+    "input_quantization": input_quantization,
     "latency_us": latency_us,
     "speedup": {"b1_over_f1_full_post_dispatch": b1_full / f1_full},
     "reduction_percent": {"full_post_dispatch": 100.0 * (b1_full - f1_full) / b1_full},
