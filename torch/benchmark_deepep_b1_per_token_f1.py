@@ -1,4 +1,5 @@
 import json
+import os
 import statistics
 
 import torch
@@ -277,6 +278,20 @@ graphs = {
     "b1_full_post_dispatch": capture(b1_full_post_dispatch),
     "f1_full_post_dispatch": capture(f1_full_post_dispatch),
 }
+if os.environ.get("K3_PROFILE_ONLY") == "1":
+    profile_replays = int(os.environ.get("K3_PROFILE_REPLAYS", "10"))
+    for name, graph in graphs.items():
+        torch.cuda.nvtx.range_push(name)
+        for _ in range(profile_replays):
+            graph.replay()
+        torch.cuda.nvtx.range_pop()
+    torch.cuda.synchronize()
+    print(
+        json.dumps(
+            {"profile_replays": profile_replays, "ranges": list(graphs)}
+        )
+    )
+    raise SystemExit(0)
 latency_us = {name: time_graph(graph) for name, graph in graphs.items()}
 b1_full = latency_us["b1_full_post_dispatch"]["mean"]
 f1_full = latency_us["f1_full_post_dispatch"]["mean"]
