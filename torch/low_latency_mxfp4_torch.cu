@@ -153,6 +153,56 @@ torch::Tensor requantize_deepep_fp8_compact_out(
   return output;
 }
 
+torch::Tensor compact_deepep_per_token_fp8_out(
+    torch::Tensor input, torch::Tensor repeated_token_scales,
+    torch::Tensor token_counts, torch::Tensor compact_offsets,
+    torch::Tensor output, torch::Tensor output_scales) {
+  check_cuda_contiguous(input, "input");
+  check_cuda_contiguous(token_counts, "token_counts");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  check_cuda_contiguous(output, "output");
+  check_cuda_contiguous(output_scales, "output_scales");
+  TORCH_CHECK(repeated_token_scales.is_cuda(),
+              "repeated_token_scales must be a CUDA tensor");
+  TORCH_CHECK(input.element_size() == 1 && output.element_size() == 1,
+              "input and output must use one-byte FP8 storage");
+  TORCH_CHECK(repeated_token_scales.scalar_type() == torch::kFloat32,
+              "repeated_token_scales must be float32");
+  TORCH_CHECK(token_counts.scalar_type() == torch::kInt32 &&
+                  compact_offsets.scalar_type() == torch::kInt32,
+              "token_counts and compact_offsets must be int32");
+  TORCH_CHECK(output_scales.scalar_type() == torch::kFloat32,
+              "output_scales must be float32");
+  TORCH_CHECK(input.dim() == 3 && repeated_token_scales.dim() == 3,
+              "DeepEP input and repeated token scales must be 3D");
+  const int64_t experts = input.size(0);
+  const int64_t capacity = input.size(1);
+  const int64_t hidden_size = input.size(2);
+  TORCH_CHECK(hidden_size > 0 && hidden_size % 128 == 0,
+              "DeepEP hidden size must be divisible by 128");
+  TORCH_CHECK(repeated_token_scales.size(0) == experts &&
+                  repeated_token_scales.size(1) == capacity &&
+                  repeated_token_scales.size(2) == hidden_size / 128,
+              "DeepEP repeated token scales must have shape [E, capacity, H/128]");
+  TORCH_CHECK(token_counts.numel() == experts &&
+                  compact_offsets.numel() == experts + 1,
+              "DeepEP counts/offsets do not match expert count");
+  TORCH_CHECK(output.dim() == 2 && output.size(0) >= experts * capacity &&
+                  output.size(1) == hidden_size,
+              "compact FP8 output capacity or shape is invalid");
+  TORCH_CHECK(output_scales.numel() >= experts * capacity,
+              "compact token-scale output capacity is too small");
+  c10::cuda::CUDAGuard device_guard(input.device());
+  mga::launch_low_latency_mxfp4_fp8_compact_deepep_per_token(
+      reinterpret_cast<const __nv_fp8_e4m3*>(input.data_ptr()),
+      repeated_token_scales.data_ptr<float>(), token_counts.data_ptr<int32_t>(),
+      compact_offsets.data_ptr<int32_t>(), experts, capacity, hidden_size,
+      repeated_token_scales.stride(0), repeated_token_scales.stride(1),
+      reinterpret_cast<__nv_fp8_e4m3*>(output.data_ptr()),
+      output_scales.data_ptr<float>(), current_stream(input));
+  return output;
+}
+
 torch::Tensor situ_quant_compact_out(
     torch::Tensor gate_up, torch::Tensor compact_offsets,
     torch::Tensor output, torch::Tensor output_scales,
@@ -448,6 +498,40 @@ torch::Tensor deepep_fp8_moe_out(
   return output;
 }
 
+torch::Tensor deepep_per_token_fp8_moe_out(
+    torch::Tensor recv_q, torch::Tensor repeated_token_scales,
+    torch::Tensor w13, torch::Tensor w13_exp_offsets,
+    torch::Tensor w13_residual, torch::Tensor w2,
+    torch::Tensor w2_exp_offsets, torch::Tensor w2_residual,
+    torch::Tensor masked_m, torch::Tensor padded_offsets,
+    torch::Tensor compact_offsets, torch::Tensor tile_experts,
+    torch::Tensor tile_n, torch::Tensor num_tiles,
+    torch::Tensor q1, torch::Tensor q1_scales,
+    torch::Tensor fc1_token_scales, torch::Tensor gate_up,
+    torch::Tensor q2, torch::Tensor q2_scales,
+    torch::Tensor fc2_token_scales, torch::Tensor output,
+    int64_t capacity, int64_t hidden_size, int64_t intermediate_size,
+    int64_t persistent_ctas, double beta, double linear_beta) {
+  prepare_deepep_layout_out(
+      masked_m, capacity, padded_offsets, compact_offsets, tile_experts,
+      tile_n, num_tiles);
+  compact_deepep_per_token_fp8_out(
+      recv_q, repeated_token_scales, masked_m, compact_offsets, q1, q1_scales);
+  grouped_gemm_out_impl(
+      q1, q1_scales, w13, w13_exp_offsets, w13_residual, compact_offsets,
+      masked_m, fc1_token_scales, tile_experts, tile_n, num_tiles, gate_up,
+      &compact_offsets, 2 * intermediate_size, hidden_size, persistent_ctas,
+      true, true, false);
+  situ_quant_compact_out(
+      gate_up, compact_offsets, q2, q2_scales, beta, linear_beta);
+  grouped_gemm_out_impl(
+      q2, q2_scales, w2, w2_exp_offsets, w2_residual, compact_offsets,
+      masked_m, fc2_token_scales, tile_experts, tile_n, num_tiles, output,
+      &padded_offsets, hidden_size, intermediate_size, persistent_ctas,
+      true, true, false);
+  return output;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("preprocess_weight", &preprocess_weight,
              "Preprocess raw MXFP4 weights for LowLatencyGroupedGEMM");
@@ -456,12 +540,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("requantize_deepep_fp8_compact_out",
              &requantize_deepep_fp8_compact_out,
              "Collapse DeepEP group-128 FP8 scales while compacting valid rows");
+  module.def("compact_deepep_per_token_fp8_out",
+             &compact_deepep_per_token_fp8_out,
+             "Compact a DeepEP per-token FP8 carrier without requantization");
   module.def("situ_quant_compact_out", &situ_quant_compact_out,
              "Apply compact Kimi K3 SiTU and per-token FP8 quantization");
   module.def("deepep_moe_out", &deepep_moe_out,
              "Run the graph-safe DeepEP padded-to-compact MXFP4 MoE pipeline");
   module.def("deepep_fp8_moe_out", &deepep_fp8_moe_out,
-             "Run the graph-safe DeepEP FP8 compact MXFP4 MoE pipeline");
+             "Run the graph-safe DeepEP group-128 FP8 compact MXFP4 MoE pipeline");
+  module.def("deepep_per_token_fp8_moe_out", &deepep_per_token_fp8_moe_out,
+             "Run the graph-safe DeepEP per-token FP8 compact MXFP4 MoE pipeline");
   module.def("grouped_gemm_out", &grouped_gemm_out,
              "Run LowLatencyGroupedGEMM into caller-owned graph-safe buffers");
   module.def("grouped_gemm_out_precomputed_counts",

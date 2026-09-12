@@ -159,6 +159,23 @@ void launch_low_latency_mxfp4_fp8_requantize_deepep_compact(
     float* output_scales,
     cudaStream_t stream);
 
+// Compact a DeepEP carrier that was already quantized with one scale per
+// token. DeepEP repeats the token scale in its group-128 carrier ABI; this
+// path preserves the FP8 bytes and keeps only the first repeated scale.
+void launch_low_latency_mxfp4_fp8_compact_deepep_per_token(
+    const __nv_fp8_e4m3* input,
+    const float* input_group_scales,
+    const int32_t* token_counts,
+    const int32_t* compact_offsets,
+    int G,
+    int capacity,
+    int hidden_size,
+    int64_t scale_stride_expert,
+    int64_t scale_stride_token,
+    __nv_fp8_e4m3* output,
+    float* output_scales,
+    cudaStream_t stream);
+
 // Apply Kimi K3 SiTU and one-scale-per-token FP8 quantization to compact
 // FC1 output. Grid capacity stays static for CUDA Graph; compact_offsets[G]
 // determines the dynamic number of valid rows on device.

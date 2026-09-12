@@ -410,6 +410,34 @@ __global__ void requantize_deepep_compact_kernel(
     }
 }
 
+__global__ void compact_deepep_per_token_kernel(
+    const __nv_fp8_e4m3* input, const float* input_group_scales,
+    const int32_t* token_counts, const int32_t* compact_offsets,
+    int G, int capacity, int hidden_size, int64_t scale_stride_expert,
+    int64_t scale_stride_token, __nv_fp8_e4m3* output,
+    float* output_scales) {
+    const int padded_row = blockIdx.x;
+    const int expert = padded_row / capacity;
+    const int local_row = padded_row - expert * capacity;
+    if (expert >= G || local_row >= token_counts[expert]) return;
+
+    const int compact_row = compact_offsets[expert] + local_row;
+    if (threadIdx.x == 0) {
+        const int64_t scale_offset =
+            static_cast<int64_t>(expert) * scale_stride_expert +
+            static_cast<int64_t>(local_row) * scale_stride_token;
+        output_scales[compact_row] = input_group_scales[scale_offset];
+    }
+
+    const int vectors = hidden_size / static_cast<int>(sizeof(int4));
+    const auto* input_vec = reinterpret_cast<const int4*>(input) +
+        static_cast<size_t>(padded_row) * vectors;
+    auto* output_vec = reinterpret_cast<int4*>(output) +
+        static_cast<size_t>(compact_row) * vectors;
+    for (int vector = threadIdx.x; vector < vectors; vector += blockDim.x)
+        output_vec[vector] = input_vec[vector];
+}
+
 __device__ __forceinline__ float situ_activate(
     float gate, float up, float beta, float linear_beta) {
     const float gate_out =
@@ -701,6 +729,27 @@ void launch_low_latency_mxfp4_fp8_requantize_deepep_compact(
         input, input_group_scales, token_counts, compact_offsets, G, capacity,
         hidden_size, scale_stride_expert, scale_stride_token,
         scale_stride_group, output, output_scales);
+}
+
+void launch_low_latency_mxfp4_fp8_compact_deepep_per_token(
+    const __nv_fp8_e4m3* input, const float* input_group_scales,
+    const int32_t* token_counts, const int32_t* compact_offsets,
+    int G, int capacity, int hidden_size, int64_t scale_stride_expert,
+    int64_t scale_stride_token, __nv_fp8_e4m3* output,
+    float* output_scales, cudaStream_t stream) {
+    if (G < 0 || capacity < 0 || hidden_size <= 0 || hidden_size % 128 != 0) {
+        abort_mxfp4("invalid DeepEP per-token FP8 compact shape");
+    }
+    if (G == 0 || capacity == 0) return;
+    if (!input || !input_group_scales || !token_counts || !compact_offsets ||
+        !output || !output_scales) {
+        abort_mxfp4("null DeepEP per-token FP8 compact tensor");
+    }
+    constexpr int kThreads = 256;
+    compact_deepep_per_token_kernel<<<G * capacity, kThreads, 0, stream>>>(
+        input, input_group_scales, token_counts, compact_offsets, G, capacity,
+        hidden_size, scale_stride_expert, scale_stride_token, output,
+        output_scales);
 }
 
 void launch_low_latency_mxfp4_fp8_situ_quant_compact(

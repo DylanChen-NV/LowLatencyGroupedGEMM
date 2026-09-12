@@ -38,6 +38,22 @@ def main():
     assert recv_scales.shape == (experts, capacity, groups)
     assert not recv_scales.is_contiguous()
 
+    # New F1 reuses B1's per-token quantization before DeepEP. The transport
+    # repeats that one scale in every legacy group slot without changing bytes.
+    token_scales = source.float().abs().amax(dim=-1) / 448.0
+    token_q = (source.float() / token_scales.unsqueeze(-1)).to(
+        torch.float8_e4m3fn
+    )
+    repeated_token_scales = (
+        token_scales.unsqueeze(-1)
+        .expand(experts, capacity, groups)
+        .permute(0, 2, 1)
+        .contiguous()
+        .permute(0, 2, 1)
+    )
+    assert repeated_token_scales.shape == (experts, capacity, groups)
+    assert not repeated_token_scales.is_contiguous()
+
     padded_offsets = torch.empty(experts + 1, dtype=torch.int32, device=device)
     compact_offsets = torch.empty_like(padded_offsets)
     tile_experts = torch.empty(rows, dtype=torch.int32, device=device)
@@ -79,6 +95,29 @@ def main():
         compact_scales[:valid_rows], expected_s_compact, rtol=0, atol=0
     )
 
+    per_token_compact_q = torch.zeros_like(compact_q)
+    per_token_compact_scales = torch.full_like(compact_scales, torch.nan)
+    llop.compact_deepep_per_token_fp8_out(
+        token_q, repeated_token_scales, counts, compact_offsets,
+        per_token_compact_q, per_token_compact_scales,
+    )
+    expected_token_q_compact = torch.cat(
+        [token_q[e, : int(counts[e].item())] for e in range(experts)]
+    )
+    expected_token_s_compact = torch.cat(
+        [token_scales[e, : int(counts[e].item())] for e in range(experts)]
+    ).unsqueeze(-1)
+    assert torch.equal(
+        per_token_compact_q[:valid_rows].view(torch.uint8),
+        expected_token_q_compact.view(torch.uint8),
+    )
+    torch.testing.assert_close(
+        per_token_compact_scales[:valid_rows],
+        expected_token_s_compact,
+        rtol=0,
+        atol=0,
+    )
+
     w13, w13_off, w13_res = make_weight(experts, 2 * intermediate, hidden, device)
     w2, w2_off, w2_res = make_weight(experts, hidden, intermediate, device)
 
@@ -101,6 +140,8 @@ def main():
 
     f1 = workspace()
     b1 = workspace()
+    per_token_f1 = workspace()
+    per_token_b1 = workspace()
 
     def run_f1():
         llop.deepep_fp8_moe_out(
@@ -110,6 +151,18 @@ def main():
             f1["fc1ts"], f1["gate_up"], f1["q2"], f1["q2s"],
             f1["fc2ts"], f1["out"], capacity, hidden, intermediate,
             528, 4.0, 25.0,
+        )
+
+    def run_per_token_f1():
+        llop.deepep_per_token_fp8_moe_out(
+            token_q, repeated_token_scales, w13, w13_off, w13_res,
+            w2, w2_off, w2_res, counts, per_token_f1["padded"],
+            per_token_f1["compact"], per_token_f1["te"], per_token_f1["tn"],
+            per_token_f1["nt"], per_token_f1["q1"], per_token_f1["q1s"],
+            per_token_f1["fc1ts"], per_token_f1["gate_up"],
+            per_token_f1["q2"], per_token_f1["q2s"],
+            per_token_f1["fc2ts"], per_token_f1["out"], capacity, hidden,
+            intermediate, 528, 4.0, 25.0,
         )
 
     padded_q = expected_q.reshape(rows, hidden).contiguous()
@@ -122,6 +175,18 @@ def main():
         capacity, hidden, intermediate, 528, 4.0, 25.0,
     )
     run_f1()
+    llop.deepep_moe_out(
+        token_q.reshape(rows, hidden).contiguous(),
+        token_scales.reshape(rows, 1).contiguous(),
+        w13, w13_off, w13_res, w2, w2_off, w2_res, counts,
+        per_token_b1["padded"], per_token_b1["compact"],
+        per_token_b1["te"], per_token_b1["tn"], per_token_b1["nt"],
+        per_token_b1["fc1ts"], per_token_b1["gate_up"],
+        per_token_b1["q2"], per_token_b1["q2s"],
+        per_token_b1["fc2ts"], per_token_b1["out"], capacity, hidden,
+        intermediate, 528, 4.0, 25.0,
+    )
+    run_per_token_f1()
     torch.cuda.synchronize()
 
     valid = torch.cat([
@@ -129,14 +194,31 @@ def main():
         for e in range(experts)
     ])
     torch.testing.assert_close(f1["out"][valid], b1["out"][valid], rtol=0, atol=0)
+    assert torch.equal(
+        per_token_f1["q1"][:valid_rows].view(torch.uint8),
+        expected_token_q_compact.view(torch.uint8),
+    )
+    torch.testing.assert_close(
+        per_token_f1["q1s"][:valid_rows], expected_token_s_compact,
+        rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        per_token_f1["out"][valid], per_token_b1["out"][valid],
+        rtol=0, atol=0,
+    )
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run_f1()
+        run_per_token_f1()
     graph.replay()
     torch.cuda.synchronize()
     assert torch.isfinite(f1["out"][valid]).all()
-    print("PASS: DeepEP group128 FP8 compact, B1 equivalence, and CUDA Graph")
+    assert torch.isfinite(per_token_f1["out"][valid]).all()
+    print(
+        "PASS: DeepEP group128 requant and per-token byte-preserving compact, "
+        "B1 equivalence, and CUDA Graph"
+    )
 
 
 if __name__ == "__main__":
