@@ -292,7 +292,10 @@ if os.environ.get("K3_PROFILE_ONLY") == "1":
         )
     )
     raise SystemExit(0)
-latency_us = {name: time_graph(graph) for name, graph in graphs.items()}
+timing_order = list(graphs.items())
+if os.environ.get("K3_REVERSE_TIMING") == "1":
+    timing_order.reverse()
+latency_us = {name: time_graph(graph) for name, graph in timing_order}
 b1_full = latency_us["b1_full_post_dispatch"]["mean"]
 f1_full = latency_us["f1_full_post_dispatch"]["mean"]
 
