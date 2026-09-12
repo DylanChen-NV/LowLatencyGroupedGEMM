@@ -284,8 +284,8 @@ if os.environ.get("K3_PROFILE_ONLY") == "1":
         torch.cuda.nvtx.range_push(name)
         for _ in range(profile_replays):
             graph.replay()
+        torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
-    torch.cuda.synchronize()
     print(
         json.dumps(
             {"profile_replays": profile_replays, "ranges": list(graphs)}
